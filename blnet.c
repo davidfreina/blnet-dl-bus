@@ -54,8 +54,11 @@ typedef struct BlnetConnection
 
 typedef struct BLNETParser
 {
-    struct tm date;
-    double analog[6];
+    double collector;
+    double buffer_bottom;
+    double buffer_top;
+    double circulation;
+    double return_flow;
     int digital[9];
     double speed[1];
     double energy;
@@ -82,6 +85,7 @@ void connect_to_bootloader(BLNETConn *conn)
 
         if (connect(conn->sock, (struct sockaddr *)&server, sizeof(server)) < 0)
         {
+            close(conn->sock);
             perror("Connection failed");
             exit(1);
         }
@@ -143,7 +147,7 @@ void query(BLNETConn *conn, const unsigned char *cmd, int cmd_len, unsigned char
     }
 }
 
-void get_latest(BLNETConn *conn)
+void get_latest(BLNETConn *conn, BLNETData *data)
 {
     unsigned char cmd[] = {GET_LATEST};
     unsigned char response[conn->actualSize];
@@ -159,12 +163,11 @@ void get_latest(BLNETConn *conn)
                 printf("%d ", response[i]);
             printf("\n");
 
-            BLNETData parsed_data;
-            parse_blnet_data(&parsed_data, response, conn->actualSize);
+            parse_blnet_data(data, response, conn->actualSize);
 
-            for (size_t i = 0; i < 6; i++)
-                printf("%f\n", parsed_data.analog[i]);
-            printf("%f\n", parsed_data.energy);
+            for (size_t i = 0; i < 5; i++)
+                printf("%f\n", *(&(data->collector) + sizeof(double) * i));
+            printf("%f\n", data->energy);
             return;
         }
     }
@@ -178,41 +181,6 @@ void get_mode(BLNETConn *conn)
     unsigned char response[1];
 
     query(conn, cmd, sizeof(cmd), response, sizeof(response));
-}
-
-int main(int argc, char *argv[])
-{
-    if (argc != 3)
-    {
-        fprintf(stderr, "Usage: %s <IP address> <port>\n", argv[0]);
-        exit(1);
-    }
-
-    const char *ip_address = argv[1];
-    int port = atoi(argv[2]);
-    if (port > UINT16_MAX)
-    {
-        fprintf(stderr, "<port> must be < 65536\n");
-        exit(1);
-    }
-
-    BLNETConn conn;
-    conn.sock = -1;
-    conn.count = -1;
-    conn.actualSize = 57;
-    conn.fetchSize = 65;
-    conn.canFrames = 1;
-    conn.address = inet_addr(ip_address);
-    conn.port = htons(port);
-
-    // Connect to bootloader using the IP address and port provided as arguments
-    connect_to_bootloader(&conn);
-    conn.actualSize = 55;
-    get_mode(&conn);
-    get_latest(&conn);
-    disconnect_from_bootloader(&conn);
-
-    return 0;
 }
 
 // Helper function to calculate the value
@@ -290,8 +258,8 @@ void parse_blnet_data(BLNETData *parsed_data, unsigned char *data, size_t data_l
     memcpy(kwh, data + 38, sizeof(unsigned short));
     memcpy(mwh, data + 40, sizeof(unsigned short));
 
-    for (int i = 0; i < 6; i++)
-        parsed_data->analog[i] = convert_analog(analog[i]);
+    for (int i = 0; i < 5; i++)
+        *(&(parsed_data->collector) + sizeof(double) * i) = convert_analog(analog[i]);
 
     // for (int i = 0; i < 9; i++)
     //     parsed_data->digital[i] = convert_digital(digital, i);
@@ -304,4 +272,79 @@ void parse_blnet_data(BLNETData *parsed_data, unsigned char *data, size_t data_l
     free(power);
     free(kwh);
     free(mwh);
+}
+
+void send_data(BLNETData *data)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == -1)
+    {
+        perror("Could not create socket");
+        exit(1);
+    }
+
+    struct sockaddr_in loxone;
+    loxone.sin_family = AF_INET;
+    loxone.sin_addr.s_addr = inet_addr("192.168.90.55");
+    loxone.sin_port = htons(7000);
+    char msg[255];
+    for (size_t i = 0; i < 5; i++)
+    {
+        snprintf(msg + strlen(msg), (254 - strlen(msg)), "sensor_%d=%.1f;", i, *(&(data->collector) + sizeof(double) * i));
+    }
+    snprintf(msg + strlen(msg), (254 - strlen(msg)), "energy=%.1f", data->energy);
+    fprintf(stdout, "%s\n", msg);
+
+    if (sendto(sock, msg, strlen(msg) + 1, 0, (struct sockaddr *)&loxone, sizeof(loxone)) < 0)
+    {
+        perror("Sending data failed");
+        close(sock);
+        exit(1);
+    }
+    else
+    {
+        close(sock);
+        fprintf(stdout, "Successfully sent data to Loxone\n");
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    // if (argc != 3)
+    // {
+    //     fprintf(stderr, "Usage: %s <IP address> <port>\n", argv[0]);
+    //     exit(1);
+    // }
+
+    // const char *ip_address = argv[1];
+    // int port = atoi(argv[2]);
+    // if (port > UINT16_MAX)
+    // {
+    //     fprintf(stderr, "<port> must be < 65536\n");
+    //     exit(1);
+    // }
+
+    BLNETConn conn;
+    conn.sock = -1;
+    conn.count = -1;
+    conn.actualSize = 57;
+    conn.fetchSize = 65;
+    conn.canFrames = 1;
+    conn.address = inet_addr("192.168.90.151");
+    conn.port = htons(40000);
+
+    while (1)
+    {
+        // Connect to bootloader using the IP address and port provided as arguments
+        connect_to_bootloader(&conn);
+        conn.actualSize = 55;
+        get_mode(&conn);
+        BLNETData data;
+        get_latest(&conn, &data);
+        send_data(&data);
+        disconnect_from_bootloader(&conn);
+        sleep(10);
+    }
+
+    return 0;
 }
