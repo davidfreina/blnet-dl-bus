@@ -5,8 +5,6 @@
 #define WAIT_TIME 0xBA
 #define MAX_RETRIES 10
 
-#define INT16_POSITIVE_MASK 0xFFFF
-#define SIGN_BIT 0x8000
 #define POSITIVE_VALUE_MASK 0x0FFF
 #define TYPE_MASK 0x7000
 #define TYPE_DIGITAL 0x1000
@@ -14,8 +12,10 @@
 #define TYPE_VOLUME 0x3000
 #define TYPE_RAS 0x7000
 #define RAS_POSITIVE_MASK 0x01FF
-#define INT32_MASK 0xFFFFFFFF
-#define INT32_SIGN 0x80000000
+#define INT8_MASK 0xFF
+#define INT8_SIGN 0x80
+#define INT16_MASK 0xFFFF
+#define INT16_SIGN 0x8000
 
 #define __SOCK_SIZE__ 16 /* sizeof(struct sockaddr)	*/
 
@@ -35,8 +35,7 @@ struct BLNETData
     float return_flow;
     float energy;
     float power;
-    int digital[9];
-    int speed[1];
+    int pump;
 };
 struct in_addr
 {
@@ -168,7 +167,7 @@ void parse_blnet_data(struct BLNETData *parsed_data, unsigned char *data, int da
 {
     unsigned short *analog = (unsigned short *)malloc(5 * sizeof(unsigned short));
     unsigned short *kwh = (unsigned short *)malloc(sizeof(unsigned short)), *mwh = (unsigned short *)malloc(sizeof(unsigned short));
-    unsigned short *power = (unsigned short *)malloc(sizeof(unsigned short));
+    unsigned char *power = (unsigned char *)malloc(sizeof(unsigned char) * 2);
 
     memcpy(analog, data + sizeof(unsigned char), 5 * sizeof(unsigned short));
     parsed_data->collector = convert_analog(analog[0]);
@@ -181,8 +180,10 @@ void parse_blnet_data(struct BLNETData *parsed_data, unsigned char *data, int da
     memcpy(mwh, data + 40, sizeof(unsigned short));
     parsed_data->energy = convert_energy(*mwh, *kwh);
 
-    memcpy(power, data + 36, sizeof(unsigned short));
-    parsed_data->power = convert_power(*power);
+    memcpy(power, data + 36, sizeof(unsigned char) * 2);
+    parsed_data->power = convert_power(power[1], power[0]);
+
+    parsed_data->pump = *(data + 35);
 
     free(power);
     free(kwh);
@@ -195,33 +196,32 @@ float convert_analog(short value)
 {
     int mask = value & TYPE_MASK;
     if (mask == TYPE_TEMP)
-        return calculate_value(value, 0.1, POSITIVE_VALUE_MASK, SIGN_BIT);
+        return calculate_value(value, 0.1, POSITIVE_VALUE_MASK, INT16_SIGN);
     else if (mask == TYPE_VOLUME)
-        return calculate_value(value, 4, POSITIVE_VALUE_MASK, SIGN_BIT);
+        return calculate_value(value, 4, POSITIVE_VALUE_MASK, INT16_SIGN);
     else if (mask == TYPE_DIGITAL)
     {
-        if (value & SIGN_BIT)
+        if (value & INT16_SIGN)
             return 1;
         else
             return 0;
     }
     else if (mask == TYPE_RAS)
-        return calculate_value(value, 0.1, RAS_POSITIVE_MASK, SIGN_BIT);
+        return calculate_value(value, 0.1, RAS_POSITIVE_MASK, INT16_SIGN);
     else
-        return calculate_value(value, 1, POSITIVE_VALUE_MASK, SIGN_BIT);
+        return calculate_value(value, 1, POSITIVE_VALUE_MASK, INT16_SIGN);
 }
 
 // Convert energy data
 float convert_energy(int mwh, int kwh)
 {
-    return mwh * 1000 + calculate_value(kwh, 0.1, INT16_POSITIVE_MASK, SIGN_BIT);
+    return mwh * 1000 + calculate_value(kwh, 0.1, INT16_MASK, INT16_SIGN);
 }
 
 // Convert power data
-float convert_power(unsigned short value)
+float convert_power(unsigned char value1, unsigned char value2)
 {
-    printf("%d\n", value);
-    return calculate_value(value, 1 / 2560.0, INT16_POSITIVE_MASK, SIGN_BIT);
+    return calculate_value(value1, 25.6, INT8_MASK, INT8_SIGN) + calculate_value(value2, 0.1, INT8_MASK, INT8_SIGN);
 }
 
 // Helper function to calculate the value
@@ -242,6 +242,7 @@ void reset_data(struct BLNETData *data)
     data->return_flow = 0;
     data->energy = 0;
     data->power = 0;
+    data->pump = 0;
 }
 
 void error_handler(struct BLNETConnection *conn)
@@ -299,7 +300,8 @@ int main()
         setoutput(4, data.return_flow);
         setoutput(5, data.energy);
         setoutput(6, data.power);
-        setoutput(7, conn.errorCount);
+        setoutput(7, data.pump);
+        setoutput(8, conn.errorCount);
 
         disconnect_from_bootloader(&conn);
         sleeps(10);

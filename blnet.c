@@ -35,6 +35,8 @@
 #define TYPE_RADIATION 0x4000
 #define TYPE_RAS 0x7000
 #define RAS_POSITIVE_MASK 0x01FF
+#define INT8_MASK 0xFF
+#define INT8_SIGN 0x80
 #define INT32_MASK 0xFFFFFFFF
 #define INT32_SIGN 0x80000000
 
@@ -54,15 +56,14 @@ typedef struct BlnetConnection
 
 typedef struct BLNETParser
 {
-    double collector;
-    double buffer_bottom;
-    double buffer_top;
-    double circulation;
-    double return_flow;
-    int digital[9];
-    double speed[1];
-    double energy;
-    double power[2];
+    float collector;
+    float buffer_bottom;
+    float buffer_top;
+    float circulation;
+    float return_flow;
+    float energy;
+    float power;
+    bool pump;
 } BLNETData;
 
 void parse_blnet_data(BLNETData *parsed_data, unsigned char *data, size_t data_len);
@@ -193,7 +194,7 @@ double calculate_value(int value, double multiplier, int positive_mask, int sign
 }
 
 // Convert analog sensor data
-double convert_analog(short value)
+float convert_analog(short value)
 {
     int mask = value & TYPE_MASK;
     if (mask == TYPE_TEMP)
@@ -208,34 +209,16 @@ double convert_analog(short value)
         return calculate_value(value, 1, POSITIVE_VALUE_MASK, SIGN_BIT);
 }
 
-// Convert digital sensor data
-int convert_digital(int value, int position)
-{
-    return (value & (1 << position)) ? DIGITAL_ON : DIGITAL_OFF;
-}
-
-// Convert speed sensor data
-double convert_speed(int value)
-{
-    if (value & SPEED_ACTIVE)
-        return -1;
-    else
-        return value & SPEED_MASK;
-}
-
 // Convert energy data
-double convert_energy(int mwh, int kwh)
+float convert_energy(int mwh, int kwh)
 {
     return mwh * 1000 + calculate_value(kwh, 0.1, INT16_POSITIVE_MASK, SIGN_BIT);
 }
 
 // Convert power data
-double convert_power(int value, int active, int position)
+float convert_power(unsigned char *value)
 {
-    if (active & position)
-        return calculate_value(value, 1 / 2560.0, INT32_MASK, INT32_SIGN);
-    else
-        return -1;
+    return calculate_value(value[0], 0.1, INT8_MASK, INT8_SIGN) + calculate_value(value[1], (256 / 10), INT8_MASK, INT8_SIGN);
 }
 
 // Parse binary data
@@ -243,35 +226,28 @@ void parse_blnet_data(BLNETData *parsed_data, unsigned char *data, size_t data_l
 {
 
     // Extract relevant parts of the data
-    unsigned short analog[6];
-    int digital;
-    int speed;
-    int active;
-    unsigned long *power = (unsigned long *)malloc(sizeof(unsigned long));
+    unsigned short *analog = (unsigned short *)malloc(5 * sizeof(unsigned short));
     unsigned short *kwh = (unsigned short *)malloc(sizeof(unsigned short)), *mwh = (unsigned short *)malloc(sizeof(unsigned short));
+    unsigned char *power = (unsigned char *)malloc(sizeof(unsigned char) * 2);
 
-    memcpy(analog, data + sizeof(unsigned char), 6 * sizeof(unsigned short));
-    // memcpy(&digital, data + 32, sizeof(int));
-    // memcpy(&speed, data + 36, sizeof(int));
-    // memcpy(&active, data + 26, sizeof(int));
-    memcpy(power, data + 34, sizeof(unsigned long));
+    memcpy(analog, data + sizeof(unsigned char), 5 * sizeof(unsigned short));
+    for (int i = 0; i < 5; i++)
+        *(&(parsed_data->collector) + sizeof(float) * i) = convert_analog(analog[i]);
+
     memcpy(kwh, data + 38, sizeof(unsigned short));
     memcpy(mwh, data + 40, sizeof(unsigned short));
-
-    for (int i = 0; i < 5; i++)
-        *(&(parsed_data->collector) + sizeof(double) * i) = convert_analog(analog[i]);
-
-    // for (int i = 0; i < 9; i++)
-    //     parsed_data->digital[i] = convert_digital(digital, i);
-
-    // parsed_data->speed[0] = convert_speed(speed);
-
     parsed_data->energy = convert_energy(*mwh, *kwh);
-    // parsed_data->power[i] = convert_power(power[i], active, i);
+
+    memcpy(power, data + 36, sizeof(unsigned char) * 2);
+    printf("%hu, %hu\n", (data + 36)[0], (data + 36)[1]);
+    parsed_data->power = convert_power(power);
+
+    parsed_data->pump = (data + 35);
 
     free(power);
     free(kwh);
     free(mwh);
+    free(analog);
 }
 
 void send_data(BLNETData *data)
@@ -292,20 +268,23 @@ void send_data(BLNETData *data)
     {
         snprintf(msg + strlen(msg), (254 - strlen(msg)), "sensor_%d=%.1f;", i, *(&(data->collector) + sizeof(double) * i));
     }
-    snprintf(msg + strlen(msg), (254 - strlen(msg)), "energy=%.1f", data->energy);
+    snprintf(msg + strlen(msg), (254 - strlen(msg)), "energy=%.1f;", data->energy);
+    snprintf(msg + strlen(msg), (254 - strlen(msg)), "power=%.1f;", data->power);
+    snprintf(msg + strlen(msg), (254 - strlen(msg)), "pump=%d", data->pump);
+
     fprintf(stdout, "%s\n", msg);
 
-    if (sendto(sock, msg, strlen(msg) + 1, 0, (struct sockaddr *)&loxone, sizeof(loxone)) < 0)
-    {
-        perror("Sending data failed");
-        close(sock);
-        exit(1);
-    }
-    else
-    {
-        close(sock);
-        fprintf(stdout, "Successfully sent data to Loxone\n");
-    }
+    // if (sendto(sock, msg, strlen(msg) + 1, 0, (struct sockaddr *)&loxone, sizeof(loxone)) < 0)
+    // {
+    //     perror("Sending data failed");
+    //     close(sock);
+    //     exit(1);
+    // }
+    // else
+    // {
+    //     close(sock);
+    //     fprintf(stdout, "Successfully sent data to Loxone\n");
+    // }
 }
 
 int main(int argc, char *argv[])
