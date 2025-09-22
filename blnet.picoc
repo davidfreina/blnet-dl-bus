@@ -9,7 +9,6 @@
 #define TYPE_MASK 0x7000
 #define TYPE_DIGITAL 0x1000
 #define TYPE_TEMP 0x2000
-#define TYPE_VOLUME 0x3000
 #define TYPE_RAS 0x7000
 #define RAS_POSITIVE_MASK 0x01FF
 #define INT8_MASK 0xFF
@@ -21,13 +20,14 @@
 
 struct BLNETConnection
 {
+    char *connection_string;
     STREAM *pTcpStream;
-    int actualSize;
     int errorCount;
 };
 
 struct BLNETData
 {
+    unsigned char *raw_data;
     float collector;
     float buffer_bottom;
     float buffer_top;
@@ -35,33 +35,20 @@ struct BLNETData
     float return_flow;
     float energy;
     float power;
-    int pump;
-};
-struct in_addr
-{
-    unsigned int s_addr;
-};
-struct sockaddr_in
-{
-    unsigned short sin_family; /* Address family		*/
-    unsigned short sin_port;   /* Port number			*/
-    struct in_addr sin_addr;   /* Internet address		*/
-    /* Pad to size of `struct sockaddr'. */
-    unsigned char __pad[__SOCK_SIZE__ - 2 - 2 - sizeof(struct in_addr)];
+    int solar_pump;
+	int circulation_pump;
 };
 
 int connect_to_bootloader(struct BLNETConnection *conn)
 {
     if (conn->pTcpStream == NULL)
     {
-        conn->pTcpStream = stream_create("/dev/tcp/192.168.90.151/40000", 0, 0);
+        conn->pTcpStream = stream_create(conn->connection_string, 0, 0);
         if (conn->pTcpStream == NULL)
         {
             printf("Could not create stream");
             return -1;
         }
-        // else
-        //     printf("Successfully connected to BL-NET\n");
     }
     return 0;
 }
@@ -72,20 +59,16 @@ void disconnect_from_bootloader(struct BLNETConnection *conn)
     {
         stream_close(conn->pTcpStream);
         conn->pTcpStream = NULL;
-        // printf("Disconnected from BL-NET\n");
     }
 }
 
 int get_mode(struct BLNETConnection *conn)
 {
-    unsigned char cmd[] = {GET_MODE};
-    unsigned char response[1];
-
-    return query(conn, cmd, sizeof(cmd), response, sizeof(response));
-    // printf("MODE: %x\n", response[0]);
+    unsigned char response;
+    return query(conn, GET_MODE, 1, &response, 1);
 }
 
-int query(struct BLNETConnection *conn, unsigned char *cmd, int cmd_len, unsigned char *response, int resp_len)
+int query(struct BLNETConnection *conn, int cmd, int cmd_len, unsigned char *response, int resp_len)
 {
     int retVal = send_command(conn->pTcpStream, cmd, cmd_len);
     if (retVal != 0)
@@ -93,9 +76,9 @@ int query(struct BLNETConnection *conn, unsigned char *cmd, int cmd_len, unsigne
     retVal = receive_response(conn->pTcpStream, response, resp_len);
     if (retVal != 0)
         return retVal;
-    if (cmd[0] == GET_MODE)
+    if (cmd == GET_MODE)
     {
-        if (response[0] != DL_MODE)
+        if (*response != DL_MODE)
         {
             printf("Wrong mode received\n");
             return -1;
@@ -109,9 +92,9 @@ int query(struct BLNETConnection *conn, unsigned char *cmd, int cmd_len, unsigne
     return 0;
 }
 
-int send_command(STREAM *pTcpStream, unsigned char *cmd, int length)
+int send_command(STREAM *pTcpStream, int cmd, int length)
 {
-    if (stream_write(pTcpStream, cmd, length) != length)
+    if (stream_write(pTcpStream, &cmd, length) != length)
     {
         printf("Send failed\n");
         return -1;
@@ -143,18 +126,14 @@ int checksum(unsigned char *data, int length)
 
 int get_latest(struct BLNETConnection *conn, struct BLNETData *data)
 {
-    unsigned char cmd[] = {GET_LATEST};
-    unsigned char response[55];
-
     for (int i = 0; i < MAX_RETRIES; i++)
     {
-        int retVal = query(conn, cmd, sizeof(cmd), response, sizeof(response));
+        int retVal = query(conn, GET_LATEST, 1, data->raw_data, 55);
         if (retVal != 0)
             return retVal;
-        if (response[0] != WAIT_TIME)
+        if (data->raw_data[0] != WAIT_TIME)
         {
-            // printf("Got latest data\n");
-            parse_blnet_data(data, response, conn->actualSize);
+            parse_blnet_data(data, 55);
             return 0;
         }
     }
@@ -163,27 +142,28 @@ int get_latest(struct BLNETConnection *conn, struct BLNETData *data)
 }
 
 // Parse binary data
-void parse_blnet_data(struct BLNETData *parsed_data, unsigned char *data, int data_len)
+void parse_blnet_data(struct BLNETData *data, int data_len)
 {
     unsigned short *analog = (unsigned short *)malloc(5 * sizeof(unsigned short));
     unsigned short *kwh = (unsigned short *)malloc(sizeof(unsigned short)), *mwh = (unsigned short *)malloc(sizeof(unsigned short));
     unsigned char *power = (unsigned char *)malloc(sizeof(unsigned char) * 2);
 
-    memcpy(analog, data + sizeof(unsigned char), 5 * sizeof(unsigned short));
-    parsed_data->collector = convert_analog(analog[0]);
-    parsed_data->buffer_bottom = convert_analog(analog[1]);
-    parsed_data->buffer_top = convert_analog(analog[2]);
-    parsed_data->circulation = convert_analog(analog[3]);
-    parsed_data->return_flow = convert_analog(analog[4]);
+    memcpy(analog, data->raw_data + sizeof(unsigned char), 5 * sizeof(unsigned short));
+    data->collector = convert_analog(analog[0]);
+    data->buffer_bottom = convert_analog(analog[1]);
+    data->buffer_top = convert_analog(analog[2]);
+    data->circulation = convert_analog(analog[3]);
+    data->return_flow = convert_analog(analog[4]);
 
-    memcpy(kwh, data + 38, sizeof(unsigned short));
-    memcpy(mwh, data + 40, sizeof(unsigned short));
-    parsed_data->energy = convert_energy(*mwh, *kwh);
+    memcpy(kwh, data->raw_data + 38, sizeof(unsigned short));
+    memcpy(mwh, data->raw_data + 40, sizeof(unsigned short));
+    data->energy = convert_energy(*mwh, *kwh);
 
-    memcpy(power, data + 36, sizeof(unsigned char) * 2);
-    parsed_data->power = convert_power(power[1], power[0]);
+    memcpy(power, data->raw_data + 36, sizeof(unsigned char) * 2);
+    data->power = convert_power(power[1], power[0]);
 
-    parsed_data->pump = *(data + 35);
+    data->solar_pump = convert_digital(*(data->raw_data + 31), 3);
+    data->circulation_pump = convert_digital(*(data->raw_data + 31), 2);
 
     free(power);
     free(kwh);
@@ -197,8 +177,6 @@ float convert_analog(short value)
     int mask = value & TYPE_MASK;
     if (mask == TYPE_TEMP)
         return calculate_value(value, 0.1, POSITIVE_VALUE_MASK, INT16_SIGN);
-    else if (mask == TYPE_VOLUME)
-        return calculate_value(value, 4, POSITIVE_VALUE_MASK, INT16_SIGN);
     else if (mask == TYPE_DIGITAL)
     {
         if (value & INT16_SIGN)
@@ -224,13 +202,33 @@ float convert_power(unsigned char value1, unsigned char value2)
     return calculate_value(value1, 25.6, INT8_MASK, INT8_SIGN) + calculate_value(value2, 0.1, INT8_MASK, INT8_SIGN);
 }
 
+// Convert power data
+// TODO: check if condition could be returned without "if"
+int convert_digital(unsigned char value, int output)
+{
+    if (value & (0x1 << (output - 1)))
+        return 1;
+    return 0;
+}
+
 // Helper function to calculate the value
 float calculate_value(int value, float multiplier, int positive_mask, int signbit)
 {
     int result = value & positive_mask;
     if (value & signbit)
-        result = -((result ^ positive_mask) + 1);
+        result = -(bitXor(result, positive_mask) + 1);
     return result * multiplier;
+}
+
+// Helper function for helper function to calculate the value
+// https://stackoverflow.com/a/12376936
+// Why: because I think Loxone does not support XOR (^)
+int bitXor(int x, int y)
+{
+    int a = x & y;
+    int b = ~x & ~y;
+    int z = ~a & ~b;
+    return z;
 }
 
 void reset_data(struct BLNETData *data)
@@ -242,7 +240,8 @@ void reset_data(struct BLNETData *data)
     data->return_flow = 0;
     data->energy = 0;
     data->power = 0;
-    data->pump = 0;
+    data->solar_pump = 0;
+    data->circulation_pump = 0;
 }
 
 void error_handler(struct BLNETConnection *conn)
@@ -255,57 +254,63 @@ void error_handler(struct BLNETConnection *conn)
 int main()
 {
     printf("START UVR61-3 READER");
-    struct BLNETConnection conn;
-    conn.pTcpStream = NULL;
-    conn.actualSize = 55;
-    conn.errorCount = 0;
+    struct BLNETConnection *conn = (struct BLNETConnection *)malloc(sizeof(struct BLNETConnection));
+    conn->pTcpStream = NULL;
+    conn->errorCount = 0;
+    unsigned int port = (unsigned int)getinput(0);                                                                             // could be unsigned short, but %hu does not seem to work -> use unsinged int for correct buffer size calculation
+    conn->connection_string = (char *)calloc(sizeof(char), strlen(getinputtext(0)) + sizeof(port) + strlen("/dev/tcp//") + 1); // 1 for string terminator
+    sprintf(conn->connection_string, "/dev/tcp/%s/%u", getinputtext(0), port);
 
-    struct BLNETData data;
-    data.buffer_bottom = 0;
-    data.buffer_top = 0;
-    data.circulation = 0;
-    data.collector = 0;
-    data.return_flow = 0;
-    data.energy = 0;
-
+    struct BLNETData *data = (struct BLNETData *)malloc(sizeof(struct BLNETData));
+    data->raw_data = (unsigned char *)malloc(sizeof(unsigned char) * 55);
     int retVal = 0;
 
-    while (1)
-    {
-        reset_data(&data);
+	while (1) {
+    	while (getinput(1))
+    	{
+        	reset_data(data);
 
-        retVal = connect_to_bootloader(&conn);
-        if (retVal != 0)
-        {
-            error_handler(&conn);
-            continue;
-        }
-        retVal = get_mode(&conn);
-        if (retVal != 0)
-        {
-            error_handler(&conn);
-            continue;
-        }
-        retVal = get_latest(&conn, &data);
-        if (retVal != 0)
-        {
-            error_handler(&conn);
-            continue;
-        }
+	        retVal = connect_to_bootloader(conn);
+ 	       if (retVal != 0)
+  	      {
+   	         error_handler(conn);
+    	        continue;
+     	   }
+      	  retVal = get_mode(conn);
+       	 if (retVal != 0)
+        	{
+         	   error_handler(conn);
+          	  continue;
+	        }
+ 	       retVal = get_latest(conn, data);
+  	      if (retVal != 0)
+   	     {
+    	        error_handler(conn);
+     	       continue;
+      	  }
 
-        setoutput(0, data.collector);
-        setoutput(1, data.buffer_bottom);
-        setoutput(2, data.buffer_top);
-        setoutput(3, data.circulation);
-        setoutput(4, data.return_flow);
-        setoutput(5, data.energy);
-        setoutput(6, data.power);
-        setoutput(7, data.pump);
-        setoutput(8, conn.errorCount);
+	        setoutput(0, data->collector);
+ 	       setoutput(1, data->buffer_bottom);
+  	      setoutput(2, data->buffer_top);
+   	     setoutput(3, data->circulation);
+    	    setoutput(4, data->return_flow);
+     	   setoutput(5, data->energy);
+      	  setoutput(6, data->power);
+	        setoutput(7, data->solar_pump);
+			setoutput(8, data->circulation_pump);
+  	      setoutput(9, conn->errorCount);
 
-        disconnect_from_bootloader(&conn);
-        sleeps(10);
-    }
+	        disconnect_from_bootloader(conn);
+	        sleeps(10);
+	    }
+		sleeps(10);
+	}
+
+
+    free(data->raw_data);
+    free(data);
+    free(conn->connection_string);
+    free(conn);
     return 0;
 }
 
